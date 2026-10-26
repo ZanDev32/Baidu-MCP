@@ -1,146 +1,161 @@
-[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/evilran-baidu-mcp-server-badge.jpg)](https://mseep.ai/app/evilran-baidu-mcp-server)
+# Baidu MCP
 
-# Baidu Search MCP Server
+A Model Context Protocol server for Baidu web search and page extraction.
 
-[![smithery badge](https://smithery.ai/badge/@Evilran/baidu-mcp-server)](https://smithery.ai/server/@Evilran/baidu-mcp-server)
+Fork of [Evilran/baidu-mcp-server](https://github.com/Evilran/baidu-mcp-server), modernised for
+the current MCP SDK: stdio **and** streamable HTTP, structured tool output, and a browser
+backend that can reuse the browser your IDE or agent harness already runs (over CDP) instead of
+downloading its own Chromium.
 
-A Model Context Protocol (MCP) server that provides web search capabilities through Baidu, with additional features for content fetching and parsing.
+## What changed from upstream
 
-<a href="https://glama.ai/mcp/servers/@Evilran/baidu-mcp-server">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/@Evilran/baidu-mcp-server/badge" alt="Baidu Server MCP server" />
-</a>
+| Area | Upstream | This fork |
+|---|---|---|
+| SDK | `mcp>=1.3` (breaks on mcp 2.x: `mcp.server.fastmcp` was removed) | `mcp>=2,<3` (`MCPServer`) |
+| Transport | stdio only | stdio (default) and `--transport streamable-http` |
+| Browser | forces a Playwright Chromium download; crashes if absent | `--browser auto\|cdp\|playwright\|http`, degrades to plain HTTP |
+| IDE / harness browser | unsupported | attaches over CDP: `--cdp-url`, or auto-discovers the oh-my-pi browser |
+| Result URLs | `m.baidu.com/...` tracking redirects | the real target URL (`data-log.mu`) |
+| Titles | often `None` | parsed from `[data-module="title"]`, widget cards filtered out |
+| Content fetch | 150-character teaser, buried in `deep_mode` | `fetch_url` tool, readable Markdown up to `max_chars` |
+| Tool output | prose string | structured JSON (`outputSchema`), `readOnlyHint` annotations |
+| Prompt-injection surface | — | bot-challenge pages detected and reported as errors |
 
-## Features
-
-- **Web Search**: Search Baidu with advanced rate limiting and result formatting
-- **Content Fetching**: Retrieve and parse webpage content with intelligent text extraction
-- **Rate Limiting**: Built-in protection against rate limits for both search and content fetching
-- **Error Handling**: Comprehensive error handling and logging
-- **LLM-Friendly Output**: Results formatted specifically for large language model consumption
-
-## Installation
-
-### Installing via Smithery
-
-To install Baidu Search Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@Evilran/baidu-mcp-server):
-
-```bash
-npx -y @smithery/cli install @Evilran/baidu-mcp-server --client claude
-```
-
-### Installing via `uv`
-
-Install directly from PyPI using `uv`:
+## Install
 
 ```bash
-uv pip install baidu-mcp-server
+# no browser download, works out of the box (plain HTTP transport)
+uvx baidu-mcp-server
+
+# with browser support (CDP attach or bundled Chromium)
+uvx --from "baidu-mcp-server[browser]" baidu-mcp-server
 ```
 
-## Usage
+`pip install baidu-mcp-server` / `pip install "baidu-mcp-server[browser]"` work too.
 
-### Running with Claude Desktop
+## MCP client configuration
 
-1. Download [Claude Desktop](https://claude.ai/download)
-2. Create or edit your Claude Desktop configuration:
-   - On macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - On Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-Add the following configuration:
+### stdio (default)
 
 ```json
 {
-    "mcpServers": {
-        "baidu-search": {
-            "command": "uvx",
-            "args": ["baidu-mcp-server"]
-        }
+  "mcpServers": {
+    "baidu": {
+      "command": "uvx",
+      "args": ["--from", "baidu-mcp-server[browser]", "baidu-mcp-server"]
     }
+  }
 }
 ```
 
-3. Restart Claude Desktop
-
-### Development
-
-For local development, you can use the MCP CLI:
+### Streamable HTTP
 
 ```bash
-# Run with the MCP Inspector
-mcp dev server.py
-
-# Install locally for testing with Claude Desktop
-mcp install server.py
-```
-## Available Tools
-
-### 1. Search Tool
-
-```python
-async def search(query: str, max_results: int = 10) -> str
+baidu-mcp-server --transport streamable-http --host 127.0.0.1 --port 8000
+# endpoint: http://127.0.0.1:8000/mcp
 ```
 
-Performs a web search on Baidu and returns formatted results.
+## Browser backends
 
-**Parameters:**
-- `query`: Search query string
-- `max_results`: Maximum number of results to return (default: 10)
+Baidu increasingly answers automated requests with a captcha. A real browser with a real
+fingerprint is the reliable path, and you may already have one running.
 
-**Returns:**
-Formatted string containing search results with titles, URLs, and snippets.
+| `--browser` | Behaviour |
+|---|---|
+| `auto` (default) | CDP endpoint if one is found, else a launched Chromium, else plain HTTP |
+| `cdp` | Attach to a running browser — no Chromium download, shares its network/TLS fingerprint |
+| `playwright` | Launch a local Playwright Chromium (needs `playwright install chromium`) |
+| `http` | No browser at all: `curl_cffi` (Chrome TLS impersonation), `httpx` fallback |
 
-### 2. Content Fetching Tool
+### Reusing the oh-my-pi / IDE browser
 
-```python
-async def fetch_content(url: str) -> str
+```bash
+# explicit endpoint
+baidu-mcp-server --browser cdp --cdp-url http://127.0.0.1:9222
+
+# or just let it auto-discover the oh-my-pi managed Chromium
+baidu-mcp-server --browser auto
 ```
 
-Fetches and parses content from a webpage.
+`auto`/`cdp` resolve the endpoint in this order:
 
-**Parameters:**
-- `url`: The webpage URL to fetch content from
+1. `--cdp-url`
+2. `BAIDU_MCP_CDP_URL`
+3. `BROWSER_CDP_URL`
+4. oh-my-pi's running browser: `~/.omp/run/daemons/*/omp.browser*.profile/DevToolsActivePort`
 
-**Returns:**
-Cleaned and formatted text content from the webpage.
+Any Chrome started with `--remote-debugging-port=9222` works, as do CDP proxies from IDEs and
+agent harnesses. The server creates an isolated browser context (own cookies, mobile UA), so it
+does not touch your open tabs.
 
-## Features in Detail
+## Tools
 
-### Rate Limiting
+### `search`
 
-- Search: Limited to 30 requests per minute
-- Content Fetching: Limited to 20 requests per minute
-- Automatic queue management and wait times
+```json
+{
+  "query": "python mcp server",
+  "max_results": 6,
+  "deep_mode": false
+}
+```
 
-### Result Processing
+Returns:
 
-- Removes ads and irrelevant content
-- Cleans up Baidu redirect URLs
-- Formats results for optimal LLM consumption
-- Truncates long content appropriately
+```json
+{
+  "query": "python mcp server",
+  "engine": "baidu",
+  "transport": "cdp",
+  "results": [
+    {
+      "title": "mcp 1.8.0 - mcp · PyPI",
+      "url": "https://pypi.org/project/mcp/1.8.0/",
+      "snippet": "We recommend using uv to manage your Python projects...",
+      "position": 1
+    }
+  ]
+}
+```
 
-### Error Handling
+`deep_mode: true` additionally fetches each result page and appends a short content preview.
 
-- Comprehensive error catching and reporting
-- Detailed logging through MCP context
-- Graceful degradation on rate limits or timeouts
+### `fetch_url`
 
-## Contributing
+```json
+{ "url": "https://example.com/article", "max_chars": 8000 }
+```
 
-Issues and pull requests are welcome! Some areas for potential improvement:
+Returns `{ "url", "content", "truncated" }`, where `content` is readability-extracted Markdown.
+Client-side redirects (`window.location.replace`, `<meta refresh>`) are followed.
 
-- Additional search parameters (region, language, etc.)
-- Enhanced content parsing options
-- Caching layer for frequently accessed content
-- Additional rate limiting strategies
+## Rate limiting
+
+Search: 30 requests/minute. Content fetching: 20 requests/minute. Excess requests wait instead
+of failing.
+
+## Configuration
+
+| Flag | Env var | Default |
+|---|---|---|
+| `--transport` | `BAIDU_MCP_TRANSPORT` | `stdio` |
+| `--host` | `BAIDU_MCP_HOST` | `127.0.0.1` |
+| `--port` | `BAIDU_MCP_PORT` | `8000` |
+| `--browser` | `BAIDU_MCP_BROWSER` | `auto` |
+| `--cdp-url` | `BAIDU_MCP_CDP_URL` | auto-discovered |
+| `--log-level` | `BAIDU_MCP_LOG_LEVEL` | `INFO` |
+
+Smoke test without an MCP client:
+
+```bash
+baidu-mcp-server --query "南京天气" --browser http
+```
+
+## Requirements
+
+Python 3.10+. Works without any browser download; `[browser]` adds Playwright for the CDP and
+launched-Chromium backends.
 
 ## License
 
-This project is licensed under the MIT License.
-
-## Acknowledgments
-
-The code in this project references the following repositories:
-
-- [nickclyde/duckduckgo-mcp-server](https://github.com/nickclyde/duckduckgo-mcp-server)
-- [BaiduSpider/BaiduSpider](https://github.com/BaiduSpider/BaiduSpider)
-
-Thanks to the authors and contributors of these repositories for their efforts and contributions to the open-source community.
+MIT. Original work © Evilran; this fork © ZanDev32.
