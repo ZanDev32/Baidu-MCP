@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -252,34 +253,87 @@ def discover_cdp_url() -> Optional[str]:
 
 
 class BrowserBackend:
-    """Lazily starts a Playwright context: launched locally or attached over CDP."""
+    """Lazily starts a Playwright context: attached over CDP or launched locally.
 
-    def __init__(self, mode: BrowserMode = "auto", cdp_url: Optional[str] = None):
+    A harness (oh-my-pi, IDE) browser is preferred whenever one is reachable:
+    discovery runs on every (re)connect, and an ``auto`` backend that had to
+    launch its own Chromium switches to the harness browser once it appears.
+    """
+
+    DISCOVERY_INTERVAL = 30.0  # seconds between probes while no CDP browser is up
+    RETRY_START_INTERVAL = 60.0  # back-off after a start attempt produced nothing
+
+    def __init__(
+        self,
+        mode: BrowserMode = "auto",
+        cdp_url: Optional[str] = None,
+        cdp_wait: float = 0.0,
+    ):
         self.requested_mode = mode
-        self.cdp_url = cdp_url or (discover_cdp_url() if mode in ("auto", "cdp") else None)
+        self.explicit_cdp_url = cdp_url
+        self.cdp_url = cdp_url
+        self.cdp_wait = cdp_wait
         self.mode: BrowserMode = "http"
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
         self._lock = asyncio.Lock()
+        self._last_discovery = 0.0
+        self._next_start_attempt = 0.0
 
     async def context(self) -> Any:
         """A Playwright BrowserContext, or None when plain HTTP is used."""
-        if self._context is not None:
-            return self._context
         async with self._lock:
-            if self._context is None:
+            if self._context is not None and not self._alive():
+                logger.info("Browser connection lost; reconnecting")
+                await self._teardown()
+            if self._context is not None and self._should_upgrade():
+                logger.info("Harness browser available; switching to it")
+                await self._teardown()
+            if self._context is None and time.monotonic() >= self._next_start_attempt:
                 await self._start()
-        return self._context
+            return self._context
+
+    def _alive(self) -> bool:
+        return self.mode != "cdp" or bool(self._browser and self._browser.is_connected())
+
+    def _should_upgrade(self) -> bool:
+        """An ``auto`` backend that self-launched should move to the harness browser."""
+        if self.requested_mode != "auto" or self.mode != "playwright":
+            return False
+        now = time.monotonic()
+        if now - self._last_discovery < self.DISCOVERY_INTERVAL:
+            return False
+        self._last_discovery = now
+        discovered = discover_cdp_url()
+        if not discovered:
+            return False
+        self.cdp_url = discovered
+        return True
+
+    async def _resolve_cdp_url(self) -> Optional[str]:
+        """Explicit endpoint wins; otherwise rediscover, optionally waiting for one."""
+        if self.explicit_cdp_url:
+            return self.explicit_cdp_url
+        if self.requested_mode not in ("auto", "cdp"):
+            return None
+        deadline = time.monotonic() + (self.cdp_wait if self.requested_mode == "cdp" else 0)
+        while True:
+            self._last_discovery = time.monotonic()
+            found = discover_cdp_url()
+            if found or time.monotonic() >= deadline:
+                return found
+            await asyncio.sleep(0.5)
 
     async def _start(self) -> None:
         if self.requested_mode == "http":
             return
 
+        self.cdp_url = await self._resolve_cdp_url()
         if self.requested_mode == "cdp" and not self.cdp_url:
             raise ToolError(
-                "No reachable CDP endpoint. Pass --cdp-url, or start a browser with "
-                "--remote-debugging-port."
+                "No reachable CDP endpoint. Start a browser with --remote-debugging-port "
+                "(or open a tab in oh-my-pi), pass --cdp-url, or raise --cdp-wait."
             )
 
         try:
@@ -329,6 +383,10 @@ class BrowserBackend:
             logger.warning("Browser unavailable (%s); falling back to HTTP", exc)
             await self._stop_playwright()
 
+        if self._context is None:
+            # Nothing started: don't retry on every call.
+            self._next_start_attempt = time.monotonic() + self.RETRY_START_INTERVAL
+
     async def _stop_playwright(self) -> None:
         if self._playwright is not None:
             try:
@@ -337,20 +395,20 @@ class BrowserBackend:
                 pass
             self._playwright = None
 
-    async def close(self) -> None:
+    async def _teardown(self) -> None:
         for resource in (self._context, self._browser):
             if resource is not None:
                 try:
                     await resource.close()
                 except Exception:  # noqa: BLE001 - best-effort teardown
                     pass
-        if self._playwright is not None:
-            try:
-                await self._playwright.stop()
-            except Exception:  # noqa: BLE001
-                pass
-        self._context = self._browser = self._playwright = None
+        await self._stop_playwright()
+        self._context = self._browser = None
         self.mode = "http"
+
+    async def close(self) -> None:
+        await self._teardown()
+        await self._stop_playwright()
 
 
 # --------------------------------------------------------------------------- #
@@ -586,6 +644,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="CDP endpoint of a running browser, e.g. http://127.0.0.1:9222",
     )
     parser.add_argument(
+        "--cdp-wait",
+        type=float,
+        default=float(os.environ.get("BAIDU_MCP_CDP_WAIT", "0")),
+        help="With --browser cdp, seconds to wait for a CDP endpoint to appear",
+    )
+    parser.add_argument(
         "--query", help="Run a single search, print JSON, and exit (smoke test)"
     )
     parser.add_argument("--log-level", default=os.environ.get("BAIDU_MCP_LOG_LEVEL", "INFO"))
@@ -601,7 +665,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
 
     global backend, fetcher, searcher
-    backend = BrowserBackend(mode=args.browser, cdp_url=args.cdp_url)
+    backend = BrowserBackend(
+        mode=args.browser, cdp_url=args.cdp_url, cdp_wait=args.cdp_wait
+    )
     fetcher = ContentFetcher(backend)
     searcher = BaiduSearcher(backend, fetcher=fetcher)
 

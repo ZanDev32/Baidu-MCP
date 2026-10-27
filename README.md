@@ -62,8 +62,8 @@ fingerprint is the reliable path, and you may already have one running.
 
 | `--browser` | Behaviour |
 |---|---|
-| `auto` (default) | CDP endpoint if one is found, else a launched Chromium, else plain HTTP |
-| `cdp` | Attach to a running browser — no Chromium download, shares its network/TLS fingerprint |
+| `auto` (default) | Prefers a harness/CDP browser, and switches to it as soon as one appears; else a launched Chromium, else plain HTTP |
+| `cdp` | Attach to a running browser — no Chromium download, shares its network/TLS fingerprint. Waits up to `--cdp-wait` seconds for one to appear, then errors |
 | `playwright` | Launch a local Playwright Chromium (needs `playwright install chromium`) |
 | `http` | No browser at all: `curl_cffi` (Chrome TLS impersonation), `httpx` fallback |
 
@@ -77,7 +77,9 @@ baidu-mcp-server --browser cdp --cdp-url http://127.0.0.1:9222
 baidu-mcp-server --browser auto
 ```
 
-`auto`/`cdp` resolve the endpoint in this order:
+Discovery is re-run every time a browser is (re)connected, so an `auto` backend that had to launch
+its own Chromium moves over to the harness browser within ~30 s of it starting, and reattaches if
+the harness browser restarts. `auto`/`cdp` resolve the endpoint in this order:
 
 1. `--cdp-url`
 2. `BAIDU_MCP_CDP_URL`
@@ -143,6 +145,7 @@ of failing.
 | `--port` | `BAIDU_MCP_PORT` | `8000` |
 | `--browser` | `BAIDU_MCP_BROWSER` | `auto` |
 | `--cdp-url` | `BAIDU_MCP_CDP_URL` | auto-discovered |
+| `--cdp-wait` | `BAIDU_MCP_CDP_WAIT` | `0` (seconds to wait for a CDP endpoint in `cdp` mode) |
 | `--log-level` | `BAIDU_MCP_LOG_LEVEL` | `INFO` |
 
 Smoke test without an MCP client:
