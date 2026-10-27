@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -210,13 +211,24 @@ def html_to_markdown(html: str) -> str:
 # --------------------------------------------------------------------------- #
 # Browser backends: bundled Playwright Chromium, or an existing CDP browser
 # --------------------------------------------------------------------------- #
+def _cdp_reachable(url: str, timeout: float = 1.0) -> bool:
+    """Probe a CDP HTTP endpoint; ``ws://`` endpoints are taken on trust."""
+    if url.startswith(("ws://", "wss://")):
+        return True
+    try:
+        with urllib.request.urlopen(
+            f"{url.rstrip('/')}/json/version", timeout=timeout
+        ) as response:
+            return response.status == 200
+    except Exception:  # noqa: BLE001 - any failure means unusable
+        return False
+
+
 def discover_cdp_url() -> Optional[str]:
     """Resolve a CDP endpoint: env var first, then a running oh-my-pi browser."""
-    for key in ("BAIDU_MCP_CDP_URL", "BROWSER_CDP_URL"):
-        value = os.environ.get(key, "").strip()
-        if value:
-            return value
-
+    candidates = [
+        os.environ.get(key, "").strip() for key in ("BAIDU_MCP_CDP_URL", "BROWSER_CDP_URL")
+    ]
     pattern = str(
         Path.home()
         / ".omp"
@@ -231,7 +243,11 @@ def discover_cdp_url() -> Optional[str]:
             port = int(Path(port_file).read_text().splitlines()[0])
         except (OSError, ValueError, IndexError):
             continue
-        return f"http://127.0.0.1:{port}"
+        candidates.append(f"http://127.0.0.1:{port}")
+
+    for url in candidates:
+        if url and _cdp_reachable(url):
+            return url
     return None
 
 
@@ -259,6 +275,12 @@ class BrowserBackend:
     async def _start(self) -> None:
         if self.requested_mode == "http":
             return
+
+        if self.requested_mode == "cdp" and not self.cdp_url:
+            raise ToolError(
+                "No reachable CDP endpoint. Pass --cdp-url, or start a browser with "
+                "--remote-debugging-port."
+            )
 
         try:
             from playwright.async_api import async_playwright
@@ -584,7 +606,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     searcher = BaiduSearcher(backend, fetcher=fetcher)
 
     if args.query:
-        results = asyncio.run(searcher.search(args.query, max_results=6))
+
+        async def run_query() -> list[SearchResult]:
+            try:
+                return await searcher.search(args.query, max_results=6)
+            finally:
+                await backend.close()  # same event loop, or Playwright deadlocks
+
+        results = asyncio.run(run_query())
         print(
             json.dumps(
                 {"query": args.query, "results": [r.as_dict() for r in results]},
@@ -592,7 +621,6 @@ def main(argv: Optional[list[str]] = None) -> None:
                 indent=2,
             )
         )
-        asyncio.run(backend.close())
         return
 
     try:
@@ -602,8 +630,6 @@ def main(argv: Optional[list[str]] = None) -> None:
             server.run("streamable-http", host=args.host, port=args.port)
     except KeyboardInterrupt:
         pass
-    finally:
-        asyncio.run(backend.close())
 
 
 if __name__ == "__main__":
